@@ -741,21 +741,21 @@ static term nif_crypto_generate_key(Context *ctx, int argc, term argv[])
     exported_pub = malloc(exported_pub_size);
     if (UNLIKELY(exported_priv == NULL || exported_pub == NULL)) {
         result = OUT_OF_MEMORY_ATOM;
-        goto cleanup;
+        goto gen_cleanup;
     }
 
     size_t exported_priv_length = 0;
     status = psa_export_key(key_id, exported_priv, exported_priv_size, &exported_priv_length);
     if (UNLIKELY(status != PSA_SUCCESS)) {
         result = make_crypto_error(__FILE__, __LINE__, "Failed private key export", ctx);
-        goto cleanup;
+        goto gen_cleanup;
     }
 
     size_t exported_pub_length = 0;
     status = psa_export_public_key(key_id, exported_pub, exported_pub_size, &exported_pub_length);
     if (UNLIKELY(status != PSA_SUCCESS)) {
         result = make_crypto_error(__FILE__, __LINE__, "Failed public key export", ctx);
-        goto cleanup;
+        goto gen_cleanup;
     }
 
     if (UNLIKELY(memory_ensure_free(ctx,
@@ -763,7 +763,7 @@ static term nif_crypto_generate_key(Context *ctx, int argc, term argv[])
                          + TERM_BINARY_HEAP_SIZE(exported_pub_length) + TUPLE_SIZE(2))
             != MEMORY_GC_OK)) {
         result = OUT_OF_MEMORY_ATOM;
-        goto cleanup;
+        goto gen_cleanup;
     }
 
     term priv_term = term_from_literal_binary(exported_priv, exported_priv_length, &ctx->heap, glb);
@@ -773,7 +773,7 @@ static term nif_crypto_generate_key(Context *ctx, int argc, term argv[])
     term_put_tuple_element(result, 0, pub_term);
     term_put_tuple_element(result, 1, priv_term);
 
-cleanup:
+gen_cleanup:
     psa_destroy_key(key_id);
     if (exported_priv) {
         memset(exported_priv, 0, exported_priv_size);
@@ -836,7 +836,7 @@ static term nif_crypto_compute_key(Context *ctx, int argc, term argv[])
                     RAISE_ERROR(BADARG_ATOM);
             }
             break;
-
+        
         default:
             RAISE_ERROR(BADARG_ATOM);
     }
@@ -877,7 +877,7 @@ static term nif_crypto_compute_key(Context *ctx, int argc, term argv[])
     uint8_t *shared_out = malloc(shared_out_size);
     if (IS_NULL_PTR(shared_out)) {
         result = OUT_OF_MEMORY_ATOM;
-        goto cleanup;
+        goto comp_cleanup;
     }
     size_t shared_len = 0;
     status = psa_raw_key_agreement(
@@ -888,21 +888,21 @@ static term nif_crypto_compute_key(Context *ctx, int argc, term argv[])
         case PSA_ERROR_NOT_SUPPORTED:
             result
                 = make_crypto_error(__FILE__, __LINE__, "Unsupported key type or parameter", ctx);
-            goto cleanup;
+            goto comp_cleanup;
         default:
             result = make_crypto_error(__FILE__, __LINE__, "Unexpected error", ctx);
-            goto cleanup;
+            goto comp_cleanup;
     }
 
     if (UNLIKELY(memory_ensure_free(ctx, TERM_BINARY_HEAP_SIZE(shared_len)) != MEMORY_GC_OK)) {
         result = OUT_OF_MEMORY_ATOM;
-        goto cleanup;
+        goto comp_cleanup;
     }
 
     success = true;
     result = term_from_literal_binary(shared_out, shared_len, &ctx->heap, glb);
 
-cleanup:
+comp_cleanup:
     psa_destroy_key(key_id);
     if (shared_out) {
         memset(shared_out, 0, shared_out_size);
@@ -945,18 +945,26 @@ static term nif_crypto_sign(Context *ctx, int argc, term argv[])
     GlobalContext *glb = ctx->global;
 
     term alg_term = argv[0];
-    if (UNLIKELY(
-            !globalcontext_is_term_equal_to_atom_string(glb, alg_term, ATOM_STR("\x5", "ecdsa")))) {
-        RAISE_ERROR(make_crypto_error(__FILE__, __LINE__, "Invalid public key", ctx));
+    bool is_eddsa = globalcontext_is_term_equal_to_atom_string(
+        glb, alg_term, ATOM_STR("\x5", "eddsa"));
+    if (UNLIKELY(!is_eddsa
+            && !globalcontext_is_term_equal_to_atom_string(
+                glb, alg_term, ATOM_STR("\x5", "ecdsa")))) {
+        RAISE_ERROR(make_crypto_error(__FILE__, __LINE__, "Invalid algorithm", ctx));
     }
 
-    term hash_algo_term = argv[1];
-    psa_algorithm_t hash_algo
-        = interop_atom_term_select_int(psa_hash_algorithm_table, hash_algo_term, glb);
-    if (UNLIKELY(hash_algo == PSA_ALG_NONE)) {
-        RAISE_ERROR(make_crypto_error(__FILE__, __LINE__, "Bad digest type", ctx));
+    psa_algorithm_t psa_key_alg;
+    if (is_eddsa) {
+        psa_key_alg = PSA_ALG_PURE_EDDSA;
+    } else {
+        term hash_algo_term = argv[1];
+        psa_algorithm_t hash_algo
+            = interop_atom_term_select_int(psa_hash_algorithm_table, hash_algo_term, glb);
+        if (UNLIKELY(hash_algo == PSA_ALG_NONE)) {
+            RAISE_ERROR(make_crypto_error(__FILE__, __LINE__, "Bad digest type", ctx));
+        }
+        psa_key_alg = PSA_ALG_ECDSA(hash_algo);
     }
-    psa_algorithm_t psa_key_alg = PSA_ALG_ECDSA(hash_algo);
 
     term data_term = argv[2];
     VALIDATE_VALUE(data_term, term_is_binary);
@@ -980,6 +988,14 @@ static term nif_crypto_sign(Context *ctx, int argc, term argv[])
     size_t psa_key_bits;
 
     switch (pk_param) {
+        case Ed25519:
+            psa_key_type = PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_TWISTED_EDWARDS);
+            psa_key_bits = 255;
+            break;
+        case Ed448:
+            psa_key_type = PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_TWISTED_EDWARDS);
+            psa_key_bits = 448;
+            break;
         case Secp256k1:
             psa_key_type = PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_K1);
             psa_key_bits = 256;
@@ -998,12 +1014,10 @@ static term nif_crypto_sign(Context *ctx, int argc, term argv[])
             break;
         default:
             RAISE_ERROR(
-                make_crypto_error(__FILE__, __LINE__, "Couldn't get ECDSA private key", ctx));
+                make_crypto_error(__FILE__, __LINE__, "Couldn't get private key", ctx));
     }
 
-    if (UNLIKELY(priv_len != PSA_BITS_TO_BYTES(psa_key_bits))) {
-        // OTP even accepts empty binaries as keys, PSA API doesn't like it
-        // so we rather fail before with an understandable error message
+    if (UNLIKELY(!is_eddsa && priv_len != PSA_BITS_TO_BYTES(psa_key_bits))) {
         RAISE_ERROR(make_crypto_error(__FILE__, __LINE__, "Couldn't get ECDSA private key", ctx));
     }
 
@@ -1029,15 +1043,17 @@ static term nif_crypto_sign(Context *ctx, int argc, term argv[])
     term result = ERROR_ATOM;
     bool success = false;
 
-    size_t sig_raw_size = PSA_ECDSA_SIGNATURE_SIZE(psa_key_bits);
+    size_t sig_raw_size = is_eddsa
+        ? (psa_key_bits == 255 ? 64 : 114)
+        : PSA_ECDSA_SIGNATURE_SIZE(psa_key_bits);
     uint8_t *sig_raw = NULL;
-    size_t sig_der_size = MBEDTLS_ECDSA_MAX_SIG_LEN(psa_key_bits);
+    size_t sig_der_size = is_eddsa ? 0 : MBEDTLS_ECDSA_MAX_SIG_LEN(psa_key_bits);
     void *sig_der = NULL;
 
     sig_raw = malloc(sig_raw_size);
     if (IS_NULL_PTR(sig_raw)) {
         result = OUT_OF_MEMORY_ATOM;
-        goto cleanup;
+        goto sign_cleanup;
     }
 
     size_t sig_raw_len = 0;
@@ -1049,41 +1065,51 @@ static term nif_crypto_sign(Context *ctx, int argc, term argv[])
         case PSA_ERROR_NOT_SUPPORTED:
             result
                 = make_crypto_error(__FILE__, __LINE__, "Unsupported key type or parameter", ctx);
-            goto cleanup;
+            goto sign_cleanup;
         default:
             result = make_crypto_error(__FILE__, __LINE__, "Unexpected error", ctx);
-            goto cleanup;
+            goto sign_cleanup;
     }
 
     assert(sig_raw_len == sig_raw_size);
 
-    sig_der = malloc(sig_der_size);
-    if (IS_NULL_PTR(sig_der)) {
-        result = OUT_OF_MEMORY_ATOM;
-        goto cleanup;
+    size_t out_len;
+    void *out_buf;
+
+    if (is_eddsa) {
+        out_len = sig_raw_len;
+        out_buf = sig_raw;
+    } else {
+        sig_der = malloc(sig_der_size);
+        if (IS_NULL_PTR(sig_der)) {
+            result = OUT_OF_MEMORY_ATOM;
+            goto sign_cleanup;
+        }
+
+        size_t sig_der_len = 0;
+        int ret = mbedtls_ecdsa_raw_to_der(
+            psa_key_bits, sig_raw, sig_raw_len, sig_der, sig_der_size, &sig_der_len);
+        if (ret != 0) {
+            result = make_crypto_error(__FILE__, __LINE__, "Unexpected error", ctx);
+            goto sign_cleanup;
+        }
+        out_len = sig_der_len;
+        out_buf = sig_der;
     }
 
-    size_t sig_der_len = 0;
-    int ret = mbedtls_ecdsa_raw_to_der(
-        psa_key_bits, sig_raw, sig_raw_len, sig_der, sig_der_size, &sig_der_len);
-    if (ret != 0) {
-        result = make_crypto_error(__FILE__, __LINE__, "Unexpected error", ctx);
-        goto cleanup;
-    }
-
-    if (UNLIKELY(memory_ensure_free(ctx, TERM_BINARY_HEAP_SIZE(sig_der_len)) != MEMORY_GC_OK)) {
+    if (UNLIKELY(memory_ensure_free(ctx, TERM_BINARY_HEAP_SIZE(out_len)) != MEMORY_GC_OK)) {
         result = OUT_OF_MEMORY_ATOM;
-        goto cleanup;
+        goto sign_cleanup;
     }
 
     success = true;
-    result = term_from_literal_binary(sig_der, sig_der_len, &ctx->heap, glb);
+    result = term_from_literal_binary(out_buf, out_len, &ctx->heap, glb);
 
-cleanup:
+sign_cleanup:
     psa_destroy_key(key_id);
 
     if (sig_raw) {
-        memset(sig_raw, 0, sig_raw_len);
+        memset(sig_raw, 0, sig_raw_size);
     }
     free(sig_raw);
 
@@ -1114,18 +1140,26 @@ static term nif_crypto_verify(Context *ctx, int argc, term argv[])
     GlobalContext *glb = ctx->global;
 
     term alg_term = argv[0];
-    if (UNLIKELY(
-            !globalcontext_is_term_equal_to_atom_string(glb, alg_term, ATOM_STR("\x5", "ecdsa")))) {
-        RAISE_ERROR(make_crypto_error(__FILE__, __LINE__, "Invalid public key", ctx));
+    bool is_eddsa = globalcontext_is_term_equal_to_atom_string(
+        glb, alg_term, ATOM_STR("\x5", "eddsa"));
+    if (UNLIKELY(!is_eddsa
+            && !globalcontext_is_term_equal_to_atom_string(
+                glb, alg_term, ATOM_STR("\x5", "ecdsa")))) {
+        RAISE_ERROR(make_crypto_error(__FILE__, __LINE__, "Invalid algorithm", ctx));
     }
 
-    term hash_algo_term = argv[1];
-    psa_algorithm_t hash_algo
-        = interop_atom_term_select_int(psa_hash_algorithm_table, hash_algo_term, glb);
-    if (UNLIKELY(hash_algo == PSA_ALG_NONE)) {
-        RAISE_ERROR(make_crypto_error(__FILE__, __LINE__, "Bad digest type", ctx));
+    psa_algorithm_t psa_key_alg;
+    if (is_eddsa) {
+        psa_key_alg = PSA_ALG_PURE_EDDSA;
+    } else {
+        term hash_algo_term = argv[1];
+        psa_algorithm_t hash_algo
+            = interop_atom_term_select_int(psa_hash_algorithm_table, hash_algo_term, glb);
+        if (UNLIKELY(hash_algo == PSA_ALG_NONE)) {
+            RAISE_ERROR(make_crypto_error(__FILE__, __LINE__, "Bad digest type", ctx));
+        }
+        psa_key_alg = PSA_ALG_ECDSA(hash_algo);
     }
-    psa_algorithm_t psa_key_alg = PSA_ALG_ECDSA(hash_algo);
 
     term data_term = argv[2];
     VALIDATE_VALUE(data_term, term_is_binary);
@@ -1154,6 +1188,14 @@ static term nif_crypto_verify(Context *ctx, int argc, term argv[])
     size_t psa_key_bits;
 
     switch (pk_param) {
+        case Ed25519:
+            psa_key_type = PSA_KEY_TYPE_ECC_PUBLIC_KEY(PSA_ECC_FAMILY_TWISTED_EDWARDS);
+            psa_key_bits = 255;
+            break;
+        case Ed448:
+            psa_key_type = PSA_KEY_TYPE_ECC_PUBLIC_KEY(PSA_ECC_FAMILY_TWISTED_EDWARDS);
+            psa_key_bits = 448;
+            break;
         case Secp256k1:
             psa_key_type = PSA_KEY_TYPE_ECC_PUBLIC_KEY(PSA_ECC_FAMILY_SECP_K1);
             psa_key_bits = 256;
@@ -1172,7 +1214,7 @@ static term nif_crypto_verify(Context *ctx, int argc, term argv[])
             break;
         default:
             RAISE_ERROR(
-                make_crypto_error(__FILE__, __LINE__, "Couldn't get ECDSA private key", ctx));
+                make_crypto_error(__FILE__, __LINE__, "Couldn't get public key", ctx));
     }
 
     psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
@@ -1192,7 +1234,7 @@ static term nif_crypto_verify(Context *ctx, int argc, term argv[])
                 make_crypto_error(__FILE__, __LINE__, "Unsupported key type or parameter", ctx));
         case PSA_ERROR_INVALID_ARGUMENT:
             RAISE_ERROR(
-                make_crypto_error(__FILE__, __LINE__, "Couldn't get ECDSA public key", ctx));
+                make_crypto_error(__FILE__, __LINE__, "Couldn't get public key", ctx));
         default:
             RAISE_ERROR(make_crypto_error(__FILE__, __LINE__, "Unexpected error", ctx));
     }
@@ -1200,23 +1242,33 @@ static term nif_crypto_verify(Context *ctx, int argc, term argv[])
     term result = ERROR_ATOM;
     bool success = false;
 
-    size_t sig_raw_size = PSA_ECDSA_SIGNATURE_SIZE(psa_key_bits);
-    void *sig_raw = malloc(sig_raw_size);
-    if (IS_NULL_PTR(sig_raw)) {
+    size_t sig_raw_size = is_eddsa ? 0 : PSA_ECDSA_SIGNATURE_SIZE(psa_key_bits);
+    void *sig_raw = is_eddsa ? NULL : malloc(sig_raw_size);
+    if (!is_eddsa && IS_NULL_PTR(sig_raw)) {
         result = OUT_OF_MEMORY_ATOM;
-    }
-    size_t sig_raw_len = 0;
-
-    int ret = mbedtls_ecdsa_der_to_raw(
-        psa_key_bits, sig_der, sig_der_len, sig_raw, sig_raw_size, &sig_raw_len);
-    if (UNLIKELY(ret != 0 || sig_raw_len != sig_raw_size)) {
-        // an invalid signature doesn't raise error on OTP, but it just fails verify
-        result = FALSE_ATOM;
-        success = true;
-        goto cleanup;
+        goto verify_cleanup;
     }
 
-    status = psa_verify_message(key_id, psa_key_alg, data, data_len, sig_raw, sig_raw_len);
+    const void *verify_sig;
+    size_t verify_sig_len;
+
+    if (is_eddsa) {
+        verify_sig = sig_der;
+        verify_sig_len = sig_der_len;
+    } else {
+        size_t sig_raw_len = 0;
+        int ret = mbedtls_ecdsa_der_to_raw(
+            psa_key_bits, sig_der, sig_der_len, sig_raw, sig_raw_size, &sig_raw_len);
+        if (UNLIKELY(ret != 0 || sig_raw_len != sig_raw_size)) {
+            result = FALSE_ATOM;
+            success = true;
+            goto verify_cleanup;
+        }
+        verify_sig = sig_raw;
+        verify_sig_len = sig_raw_len;
+    }
+
+    status = psa_verify_message(key_id, psa_key_alg, data, data_len, verify_sig, verify_sig_len);
     switch (status) {
         case PSA_SUCCESS:
             result = TRUE_ATOM;
@@ -1237,11 +1289,11 @@ static term nif_crypto_verify(Context *ctx, int argc, term argv[])
             result = make_crypto_error(__FILE__, __LINE__, "Unexpected error", ctx);
     }
 
-cleanup:
+verify_cleanup:
     psa_destroy_key(key_id);
 
     if (sig_raw) {
-        memset(sig_raw, 0, sig_raw_len);
+        memset(sig_raw, 0, sig_raw_size);
     }
     free(sig_raw);
 
@@ -1348,7 +1400,7 @@ static term nif_crypto_mac(Context *ctx, int argc, term argv[])
     void *mac_out = malloc(mac_out_size);
     if (IS_NULL_PTR(mac_out)) {
         result = OUT_OF_MEMORY_ATOM;
-        goto cleanup;
+        goto mac_cleanup;
     }
 
     size_t mac_len = 0;
@@ -1358,21 +1410,21 @@ static term nif_crypto_mac(Context *ctx, int argc, term argv[])
             break;
         case PSA_ERROR_NOT_SUPPORTED:
             result = make_crypto_error(__FILE__, __LINE__, "Unsupported algorithm", ctx);
-            goto cleanup;
+            goto mac_cleanup;
         default:
             result = make_crypto_error(__FILE__, __LINE__, "Unexpected error", ctx);
-            goto cleanup;
+            goto mac_cleanup;
     }
 
     if (UNLIKELY(memory_ensure_free(ctx, TERM_BINARY_HEAP_SIZE(mac_len)) != MEMORY_GC_OK)) {
         result = OUT_OF_MEMORY_ATOM;
-        goto cleanup;
+        goto mac_cleanup;
     }
 
     success = true;
     result = term_from_literal_binary(mac_out, mac_len, &ctx->heap, glb);
 
-cleanup:
+mac_cleanup:
     psa_destroy_key(key_id);
     if (mac_out) {
         memset(mac_out, 0, mac_out_size);
@@ -1386,7 +1438,7 @@ cleanup:
     return result;
 }
 
-#endif
+#endif /* MBEDTLS_PSA_CRYPTO_C */
 
 // not static since we are using it elsewhere to provide backward compatibility
 term nif_crypto_strong_rand_bytes(Context *ctx, int argc, term argv[])
@@ -1455,6 +1507,10 @@ term nif_crypto_info_lib(Context *ctx, int argc, term argv[])
     return term_list_prepend(mbedtls_tuple, term_nil(), &ctx->heap);
 }
 
+//
+// NIF structs
+//
+
 static const struct Nif crypto_hash_nif = {
     .base.type = NIFFunctionType,
     .nif_ptr = nif_crypto_hash
@@ -1488,7 +1544,7 @@ static const struct Nif crypto_mac_nif = {
     .base.type = NIFFunctionType,
     .nif_ptr = nif_crypto_mac
 };
-#endif
+#endif /* MBEDTLS_PSA_CRYPTO_C */
 static const struct Nif crypto_strong_rand_bytes_nif = {
     .base.type = NIFFunctionType,
     .nif_ptr = nif_crypto_strong_rand_bytes

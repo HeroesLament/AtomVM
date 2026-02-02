@@ -19,11 +19,13 @@
 %
 
 -module(test_crypto_pk).
--export([start/0, test_generate_and_compute_key/0, test_sign_and_verify/0]).
+-export([start/0, test_generate_and_compute_key/0, test_sign_and_verify/0,
+         test_eddsa_sign_and_verify/0]).
 
 start() ->
     ok = mbedtls_conditional_run(test_generate_and_compute_key, 16#03000000),
     ok = mbedtls_conditional_run(test_sign_and_verify, 16#03060100),
+    ok = mbedtls_conditional_run(test_eddsa_sign_and_verify, 16#03060100),
     0.
 
 mbedtls_conditional_run(F, RVer) ->
@@ -71,11 +73,61 @@ test_generate_and_compute_key() ->
 test_sign_and_verify() ->
     Data = <<"Hello">>,
 
+    %% ECDSA with secp256r1
     {SECPPub, SECPPriv} = crypto:generate_key(ecdh, secp256r1),
     Sig = crypto:sign(ecdsa, sha256, Data, [SECPPriv, secp256r1]),
 
     false = crypto:verify(ecdsa, sha256, <<"Invalid">>, Sig, [SECPPub, secp256r1]),
     false = crypto:verify(ecdsa, sha256, Data, <<"InvalidSig">>, [SECPPub, secp256r1]),
     true = crypto:verify(ecdsa, sha256, Data, Sig, [SECPPub, secp256r1]),
+
+    %% EdDSA with Ed25519
+    {EdPub, EdPriv} = crypto:generate_key(eddsa, ed25519),
+    EdSig = crypto:sign(eddsa, none, Data, [EdPriv, ed25519]),
+    64 = byte_size(EdSig),
+
+    true = crypto:verify(eddsa, none, Data, EdSig, [EdPub, ed25519]),
+    false = crypto:verify(eddsa, none, <<"Invalid">>, EdSig, [EdPub, ed25519]),
+
+    ok.
+
+test_eddsa_sign_and_verify() ->
+    %% Key generation produces correct sizes
+    {Pub, Priv} = crypto:generate_key(eddsa, ed25519),
+    true = is_binary(Pub),
+    32 = byte_size(Pub),
+    true = is_binary(Priv),
+    32 = byte_size(Priv),
+
+    %% Sign empty message
+    EmptySig = crypto:sign(eddsa, none, <<>>, [Priv, ed25519]),
+    64 = byte_size(EmptySig),
+    true = crypto:verify(eddsa, none, <<>>, EmptySig, [Pub, ed25519]),
+
+    %% Sign non-trivial message
+    Msg = <<"The quick brown fox jumps over the lazy dog">>,
+    Sig = crypto:sign(eddsa, none, Msg, [Priv, ed25519]),
+    64 = byte_size(Sig),
+    true = crypto:verify(eddsa, none, Msg, Sig, [Pub, ed25519]),
+
+    %% Wrong message fails verify
+    false = crypto:verify(eddsa, none, <<"wrong">>, Sig, [Pub, ed25519]),
+
+    %% Corrupted signature fails verify
+    <<SigHead:8/binary, SigByte:8, SigTail/binary>> = Sig,
+    Corrupted = <<SigHead/binary, (SigByte bxor 16#FF):8, SigTail/binary>>,
+    64 = byte_size(Corrupted),
+    false = crypto:verify(eddsa, none, Msg, Corrupted, [Pub, ed25519]),
+
+    %% Signature from one key doesn't verify with another key
+    {Pub2, Priv2} = crypto:generate_key(eddsa, ed25519),
+    Sig2 = crypto:sign(eddsa, none, Msg, [Priv2, ed25519]),
+    true = crypto:verify(eddsa, none, Msg, Sig2, [Pub2, ed25519]),
+    false = crypto:verify(eddsa, none, Msg, Sig2, [Pub, ed25519]),
+    false = crypto:verify(eddsa, none, Msg, Sig, [Pub2, ed25519]),
+
+    %% Deterministic: same key + same message = same signature
+    Sig3 = crypto:sign(eddsa, none, Msg, [Priv, ed25519]),
+    true = (Sig =:= Sig3),
 
     ok.
